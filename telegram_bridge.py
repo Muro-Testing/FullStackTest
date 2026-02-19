@@ -4,6 +4,11 @@ Telegram-Cline Bridge
 
 A Telegram bot that connects to a locally running Cline CLI instance
 in interactive mode and allows remote interaction through Telegram messages.
+
+Features:
+- Bidirectional: Control from both Telegram AND terminal
+- Live streaming: See Cline output in real-time in both places
+- File handling: Auto-sends created files via Telegram
 """
 
 import os
@@ -11,8 +16,11 @@ import re
 import asyncio
 import logging
 import glob
+import sys
+import threading
 from typing import Optional, List
 from pathlib import Path
+from queue import Queue
 
 from dotenv import load_dotenv
 from telegram import Update, InputFile
@@ -20,6 +28,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # Load environment variables
 load_dotenv()
+
+# Global message queue for terminal input
+terminal_input_queue = Queue()
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -41,22 +52,90 @@ logger = logging.getLogger(__name__)
 
 
 class ClineSession:
-    """Manages Cline execution in request-response mode."""
+    """Manages Cline execution with persistent session support."""
     
     def __init__(self, working_dir: str = None, model: str = None):
         self.lock = asyncio.Lock()
         self.working_dir = working_dir or CLINE_WORKING_DIR
         self.model = model or CLINE_MODEL
         self.task_id = None  # For resuming tasks
+        self.process = None  # Persistent Cline process
+        self.reader_task = None
+        self.output_buffer = ""
+        self.session_active = False
+        self.total_tokens = 0
+        self.messages_sent = 0
+        self.session_start_time = None
     
     def is_alive(self) -> bool:
-        """Check if Cline is available."""
-        # In request-response mode, we spawn fresh each time
-        return True
+        """Check if Cline process is running."""
+        return self.process is not None and self.process.returncode is None
+    
+    def get_stats(self) -> dict:
+        """Get session statistics."""
+        import time
+        uptime = 0
+        if self.session_start_time:
+            uptime = int(time.time() - self.session_start_time)
+        
+        return {
+            "active": self.is_alive(),
+            "task_id": self.task_id,
+            "tokens": self.total_tokens,
+            "messages": self.messages_sent,
+            "uptime_seconds": uptime,
+            "model": self.model,
+            "working_dir": self.working_dir
+        }
+    
+    async def start_interactive(self) -> bool:
+        """Start Cline in interactive mode for persistent session."""
+        try:
+            cmd = [CLINE_PATH]
+            if CLINE_YOLO:
+                cmd.append("--yolo")
+            cmd.extend(["--model", self.model])
+            cmd.extend(["--cwd", self.working_dir])
+            
+            logger.info(f"Starting Cline interactive: {' '.join(cmd[:4])}")
+            
+            self.process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.working_dir
+            )
+            self.session_active = True
+            self.session_start_time = time.time() if 'time' in dir() else 0
+            import time
+            self.session_start_time = time.time()
+            
+            logger.info("Cline interactive session started")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start Cline: {e}")
+            return False
+    
+    async def stop(self):
+        """Stop the Cline process."""
+        if self.process:
+            try:
+                self.process.terminate()
+                await asyncio.wait_for(self.process.wait(), timeout=5)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
+        self.process = None
+        self.session_active = False
     
     def restart(self) -> str:
         """Reset session state."""
         self.task_id = None
+        self.total_tokens = 0
+        self.messages_sent = 0
         return "Cline session reset. Next message will start fresh."
     
     @staticmethod
@@ -140,16 +219,46 @@ class TelegramClineBridge:
             try:
                 import time
                 
-                # Build Cline command
+                # Read memory files for context
+                context_preamble = ""
+                memory_file = os.path.join(self.cline.working_dir, "CLINE_MEMORY.md")
+                agents_file = os.path.join(self.cline.working_dir, "CLINE_AGENTS.md")
+                
+                if os.path.exists(memory_file):
+                    try:
+                        with open(memory_file, 'r') as f:
+                            context_preamble += f"\n\n[MEMORY CONTEXT - Read this first:]\n{f.read()[:2000]}"
+                    except:
+                        pass
+                
+                if os.path.exists(agents_file):
+                    try:
+                        with open(agents_file, 'r') as f:
+                            context_preamble += f"\n\n[AGENT INSTRUCTIONS:]\n{f.read()[:1500]}"
+                    except:
+                        pass
+                
+                # Build Cline command with context
                 cmd = [CLINE_PATH]  # Use configured path to cline
                 
                 if CLINE_YOLO:
                     cmd.append("--yolo")
                 
-                cmd.extend(["--model", self.cline.model])
+                # Resume existing task if available
+                if self.cline.task_id:
+                    cmd.extend(["--taskId", self.cline.task_id])
+                    logger.info(f"Resuming task: {self.cline.task_id}")
+                else:
+                    cmd.extend(["--model", self.cline.model])
+                
                 cmd.extend(["--timeout", str(CLINE_TIMEOUT)])
                 cmd.extend(["--cwd", self.cline.working_dir])
-                cmd.append(message)
+                
+                # Prepend context if available
+                if context_preamble:
+                    cmd.append(f"Context:{context_preamble}\n\nUser message: {message}")
+                else:
+                    cmd.append(message)
                 
                 logger.info(f"Running Cline: {' '.join(cmd[:4])}... (message)")
                 
@@ -193,9 +302,17 @@ class TelegramClineBridge:
                             chunk_str = chunk.decode('utf-8', errors='replace')
                             output += chunk_str
                             
-                            # Log to terminal
+                            # Log to terminal prominently
                             if chunk_str.strip():
-                                logger.info(f"Cline: {chunk_str.strip()[:100]}...")
+                                # Clean and print to terminal for visibility
+                                clean_chunk = self.cline.clean_output(chunk_str)
+                                if clean_chunk:
+                                    print("\n" + "="*60)
+                                    print("🤖 CLINE OUTPUT:")
+                                    print("-"*60)
+                                    print(clean_chunk[:500])
+                                    print("="*60 + "\n")
+                                    logger.info(f"Cline: {clean_chunk[:100]}...")
                             
                             # Try to extract task ID
                             if not task_id:
@@ -333,15 +450,31 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /status command."""
+    """Handle /status command - show detailed session stats."""
     user_id = update.effective_user.id
     
     if not is_authorized(user_id):
         await update.message.reply_text("Unauthorized access.")
         return
     
-    status = "alive" if bridge.cline.is_alive() else "dead"
-    await update.message.reply_text(f"Cline status: {status}")
+    stats = bridge.cline.get_stats()
+    
+    status_emoji = "🟢" if stats["active"] else "🔴"
+    uptime_mins = stats["uptime_seconds"] // 60
+    uptime_secs = stats["uptime_seconds"] % 60
+    
+    msg = (
+        f"📊 *Session Statistics*\n\n"
+        f"*Status:* {status_emoji} {'Active' if stats['active'] else 'Inactive'}\n"
+        f"*Task ID:* `{stats['task_id'] or 'None'}`\n"
+        f"*Messages:* {stats['messages']}\n"
+        f"*Uptime:* {uptime_mins}m {uptime_secs}s\n"
+        f"*Model:* `{stats['model']}`\n"
+        f"*Directory:* `{stats['working_dir']}`\n\n"
+        f"_Use /reset to start a new session_"
+    )
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -606,8 +739,65 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(f"❌ Failed to send: `{os.path.basename(file_path)}` - {str(e)}", parse_mode="Markdown")
 
 
+def terminal_input_thread():
+    """Thread to read terminal input and queue it for Cline."""
+    print("\n" + "="*60)
+    print("🖥️  TERMINAL INPUT MODE")
+    print("="*60)
+    print("Type your message and press Enter to send to Cline.")
+    print("Messages will be sent from both Terminal AND Telegram.")
+    print("="*60 + "\n")
+    
+    while True:
+        try:
+            user_input = input("💬 You: ")
+            if user_input.strip():
+                terminal_input_queue.put(user_input)
+                print("✅ Message queued for Cline...\n")
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            print("\n👋 Exiting terminal input mode...")
+            break
+
+
+async def process_terminal_input(context):
+    """Process terminal input and send to Cline."""
+    while True:
+        try:
+            if not terminal_input_queue.empty():
+                message = terminal_input_queue.get()
+                print(f"\n🤖 Processing terminal message: {message[:50]}...")
+                
+                # Track files
+                bridge.track_current_files()
+                
+                # Send to Cline
+                response, task_id, _ = await bridge.send_to_cline(message, chat_id=None, context=None)
+                
+                # Show response
+                print("\n" + "="*60)
+                print("🤖 CLINE RESPONSE:")
+                print("-"*60)
+                print(response or "✅ Completed")
+                print("="*60 + "\n")
+                
+                # Check for new files
+                new_files = bridge.get_new_files()
+                if new_files:
+                    print(f"📎 New files created: {len(new_files)}")
+                    for f in new_files:
+                        print(f"  • {os.path.basename(f)}")
+                    print()
+                    
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Error processing terminal input: {e}")
+            await asyncio.sleep(1)
+
+
 def main() -> None:
-    """Start the bot."""
+    """Start the bot with both Telegram and Terminal interfaces."""
     global bridge
     
     # Validate configuration
@@ -621,6 +811,10 @@ def main() -> None:
     
     # Initialize bridge
     bridge = TelegramClineBridge()
+    
+    # Start terminal input thread
+    input_thread = threading.Thread(target=terminal_input_thread, daemon=True)
+    input_thread.start()
     
     # Create application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -637,8 +831,14 @@ def main() -> None:
     application.add_handler(CommandHandler("get", get_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Start bot
-    logger.info("Starting Telegram-Cline Bridge...")
+    # Start bot with terminal input processing
+    logger.info("Starting Telegram-Cline Bridge with Terminal Interface...")
+    
+    async def post_init(application):
+        """Start terminal input processing after bot initializes."""
+        asyncio.create_task(process_terminal_input(application))
+    
+    application.post_init = post_init
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
