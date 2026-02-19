@@ -11,9 +11,7 @@ import re
 import asyncio
 import logging
 from typing import Optional
-from pathlib import Path
 
-import pexpect
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -26,10 +24,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 
 # Cline configuration
-CLINE_PROMPT_PATTERN = os.getenv("CLINE_PROMPT_PATTERN", r"\n>")
 CLINE_TIMEOUT = int(os.getenv("CLINE_TIMEOUT", "120"))
 CLINE_WORKING_DIR = os.getenv("CLINE_WORKING_DIR", os.getcwd())
 CLINE_MODEL = os.getenv("CLINE_MODEL", "claude-3-5-sonnet-20241022")
+CLINE_YOLO = os.getenv("CLINE_YOLO", "true").lower() == "true"
 
 # Logging setup
 logging.basicConfig(
@@ -40,50 +38,30 @@ logger = logging.getLogger(__name__)
 
 
 class ClineSession:
-    """Manages the persistent Cline interactive session."""
+    """Manages Cline execution in request-response mode."""
     
     def __init__(self, working_dir: str = None, model: str = None):
-        self.process: Optional[pexpect.spawn] = None
         self.lock = asyncio.Lock()
         self.working_dir = working_dir or CLINE_WORKING_DIR
         self.model = model or CLINE_MODEL
-        self.last_output = ""
-        self._start_session()
-    
-    def _start_session(self) -> None:
-        """Start a new Cline interactive session."""
-        try:
-            logger.info(f"Starting Cline interactive session in {self.working_dir}...")
-            self.process = pexpect.spawn(
-                "cline",
-                encoding="utf-8",
-                timeout=CLINE_TIMEOUT,
-                cwd=self.working_dir
-            )
-            # Wait for initial prompt
-            self.process.expect(CLINE_PROMPT_PATTERN, timeout=30)
-            logger.info("Cline session started successfully")
-        except Exception as e:
-            logger.error(f"Failed to start Cline session: {e}")
-            self.process = None
+        self.task_id = None  # For resuming tasks
     
     def is_alive(self) -> bool:
-        """Check if Cline process is still running."""
-        return self.process is not None and self.process.isalive()
+        """Check if Cline is available."""
+        # In request-response mode, we spawn fresh each time
+        return True
     
     def restart(self) -> str:
-        """Restart the Cline session."""
-        if self.process:
-            try:
-                self.process.close(force=True)
-            except Exception:
-                pass
-        self._start_session()
-        return "Cline restarted." if self.is_alive() else "Failed to restart Cline."
+        """Reset session state."""
+        self.task_id = None
+        return "Cline session reset. Next message will start fresh."
     
     @staticmethod
     def clean_output(text: str) -> str:
         """Remove ANSI escape sequences and clean up output."""
+        if not text:
+            return ""
+        
         # Remove ANSI escape sequences
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         text = ansi_escape.sub('', text)
@@ -92,8 +70,26 @@ class ClineSession:
         cursor_codes = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
         text = cursor_codes.sub('', text)
         
+        # Remove screen clearing codes
+        text = re.sub(r'\x1b\[2J', '', text)
+        text = re.sub(r'\x1b\[H', '', text)
+        
+        # Remove other control characters but keep newlines
+        text = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f]', '', text)
+        
         # Strip excessive blank lines
         text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Remove lines that are just UI decorations
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            # Skip lines that are mostly special characters (UI borders)
+            stripped = line.strip()
+            if stripped and not all(c in '─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬─━│┃┄┅┆┇┈┉┊┋' for c in stripped):
+                cleaned_lines.append(line)
+        
+        text = '\n'.join(cleaned_lines)
         
         # Truncate if too long for Telegram (4000 char limit)
         if len(text) > 4000:
@@ -111,39 +107,54 @@ class TelegramClineBridge:
     async def send_to_cline(self, message: str) -> str:
         """Send a message to Cline and return the response."""
         async with self.cline.lock:
-            if not self.cline.is_alive():
-                logger.warning("Cline process died, restarting...")
-                self.cline.restart()
-                if not self.cline.is_alive():
-                    return "Error: Cline is not available. Please try again later."
-            
             try:
-                # Send message to Cline
-                self.cline.process.sendline(message)
+                import time
+                import subprocess
+                import json
                 
-                # Wait for response (prompt pattern indicates end)
-                self.cline.process.expect(CLINE_PROMPT_PATTERN, timeout=CLINE_TIMEOUT)
+                # Build Cline command
+                cmd = ["cline"]
                 
-                # Get the output
-                output = self.cline.process.before or ""
+                if CLINE_YOLO:
+                    cmd.append("--yolo")
                 
-                return self.cline.clean_output(output)
+                cmd.extend(["--model", self.cline.model])
+                cmd.extend(["--timeout", str(CLINE_TIMEOUT)])
+                cmd.extend(["--cwd", self.cline.working_dir])
+                cmd.append(message)
                 
-            except pexpect.TIMEOUT:
-                # Return partial output on timeout
-                output = self.cline.process.before or ""
-                if output:
-                    return self.cline.clean_output(output) + "\n\n[Response timed out]"
-                return "Error: Cline response timed out."
+                logger.info(f"Running Cline: {' '.join(cmd[:4])}... (message)")
                 
-            except pexpect.EOF:
-                logger.error("Cline process ended unexpectedly")
-                self.cline.restart()
-                return "Cline process ended unexpectedly. Restarting..."
+                # Run Cline and capture output
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self.cline.working_dir
+                )
                 
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=CLINE_TIMEOUT + 10
+                    )
+                except asyncio.TimeoutError:
+                    process.kill()
+                    return "⏱️ Cline timed out. Try with a simpler request or increase timeout."
+                
+                output = stdout.decode('utf-8', errors='replace')
+                error = stderr.decode('utf-8', errors='replace')
+                
+                if process.returncode != 0 and error:
+                    logger.error(f"Cline error: {error}")
+                    # Still return output if there is any
+                
+                return self.cline.clean_output(output) or "✅ Cline completed. No text output."
+                
+            except FileNotFoundError:
+                return "❌ Cline CLI not found. Make sure it's installed and in PATH."
             except Exception as e:
                 logger.error(f"Error communicating with Cline: {e}")
-                self.cline.restart()
                 return f"Error: {str(e)}"
 
 
@@ -317,7 +328,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Send to Cline and get response
     response = await bridge.send_to_cline(user_message)
     
-    # Send response back to user
+    # Send response back to user (handle empty response)
+    if not response or not response.strip():
+        response = "✅ Message sent to Cline. No text output captured (Cline may be processing or waiting for input)."
+    
     await update.message.reply_text(response)
 
 
