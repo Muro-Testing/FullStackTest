@@ -105,13 +105,11 @@ class TelegramClineBridge:
     def __init__(self):
         self.cline = ClineSession()
     
-    async def send_to_cline(self, message: str) -> str:
+    async def send_to_cline(self, message: str, chat_id: int = None, context = None) -> str:
         """Send a message to Cline and return the response."""
         async with self.cline.lock:
             try:
                 import time
-                import subprocess
-                import json
                 
                 # Build Cline command
                 cmd = [CLINE_PATH]  # Use configured path to cline
@@ -126,7 +124,7 @@ class TelegramClineBridge:
                 
                 logger.info(f"Running Cline: {' '.join(cmd[:4])}... (message)")
                 
-                # Run Cline and capture output
+                # Run Cline and capture output in real-time
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -134,22 +132,67 @@ class TelegramClineBridge:
                     cwd=self.cline.working_dir
                 )
                 
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(),
-                        timeout=CLINE_TIMEOUT + 10
-                    )
-                except asyncio.TimeoutError:
-                    process.kill()
-                    return "⏱️ Cline timed out. Try with a simpler request or increase timeout."
+                # Collect output in real-time with typing indicator
+                output = ""
+                last_typing_time = 0
                 
-                output = stdout.decode('utf-8', errors='replace')
+                while True:
+                    try:
+                        # Read a chunk of output
+                        chunk = await asyncio.wait_for(
+                            process.stdout.read(1024),
+                            timeout=1.0
+                        )
+                        
+                        if chunk:
+                            chunk_str = chunk.decode('utf-8', errors='replace')
+                            output += chunk_str
+                            
+                            # Log each chunk to terminal
+                            if chunk_str.strip():
+                                logger.info(f"Cline: {chunk_str.strip()[:100]}...")
+                            
+                            # Send typing indicator every 3 seconds
+                            current_time = time.time()
+                            if context and chat_id and (current_time - last_typing_time) > 3:
+                                try:
+                                    await context.bot.send_chat_action(
+                                        chat_id=chat_id,
+                                        action="typing"
+                                    )
+                                    last_typing_time = current_time
+                                except:
+                                    pass
+                        
+                        # Check if process finished
+                        if process.returncode is not None:
+                            break
+                            
+                    except asyncio.TimeoutError:
+                        # No output for 1 second, check if process is done
+                        if process.returncode is not None:
+                            break
+                            
+                        # Still running, send typing indicator
+                        current_time = time.time()
+                        if context and chat_id and (current_time - last_typing_time) > 3:
+                            try:
+                                await context.bot.send_chat_action(
+                                    chat_id=chat_id,
+                                    action="typing"
+                                )
+                                last_typing_time = current_time
+                            except:
+                                pass
+                
+                # Get any remaining stderr
+                stderr = await process.stderr.read()
                 error = stderr.decode('utf-8', errors='replace')
                 
                 if process.returncode != 0 and error:
                     logger.error(f"Cline error: {error}")
-                    # Still return output if there is any
                 
+                logger.info(f"Cline completed. Output length: {len(output)} chars")
                 return self.cline.clean_output(output) or "✅ Cline completed. No text output."
                 
             except FileNotFoundError:
@@ -318,6 +361,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming text messages."""
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
     if not is_authorized(user_id):
         await update.message.reply_text("Unauthorized access.")
@@ -326,8 +370,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_message = update.message.text
     logger.info(f"Message from {user_id}: {user_message[:50]}...")
     
-    # Send to Cline and get response
-    response = await bridge.send_to_cline(user_message)
+    # Send initial "processing" message
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    
+    # Send to Cline and get response (with typing indicators)
+    response = await bridge.send_to_cline(user_message, chat_id=chat_id, context=context)
     
     # Send response back to user (handle empty response)
     if not response or not response.strip():
