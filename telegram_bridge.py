@@ -11,6 +11,7 @@ import re
 import asyncio
 import logging
 from typing import Optional
+from pathlib import Path
 
 import pexpect
 from dotenv import load_dotenv
@@ -24,9 +25,11 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 
-# Prompt pattern to detect Cline's response end
+# Cline configuration
 CLINE_PROMPT_PATTERN = os.getenv("CLINE_PROMPT_PATTERN", r"\n>")
 CLINE_TIMEOUT = int(os.getenv("CLINE_TIMEOUT", "120"))
+CLINE_WORKING_DIR = os.getenv("CLINE_WORKING_DIR", os.getcwd())
+CLINE_MODEL = os.getenv("CLINE_MODEL", "claude-3-5-sonnet-20241022")
 
 # Logging setup
 logging.basicConfig(
@@ -39,19 +42,23 @@ logger = logging.getLogger(__name__)
 class ClineSession:
     """Manages the persistent Cline interactive session."""
     
-    def __init__(self):
+    def __init__(self, working_dir: str = None, model: str = None):
         self.process: Optional[pexpect.spawn] = None
         self.lock = asyncio.Lock()
+        self.working_dir = working_dir or CLINE_WORKING_DIR
+        self.model = model or CLINE_MODEL
+        self.last_output = ""
         self._start_session()
     
     def _start_session(self) -> None:
         """Start a new Cline interactive session."""
         try:
-            logger.info("Starting Cline interactive session...")
+            logger.info(f"Starting Cline interactive session in {self.working_dir}...")
             self.process = pexpect.spawn(
                 "cline",
                 encoding="utf-8",
-                timeout=CLINE_TIMEOUT
+                timeout=CLINE_TIMEOUT,
+                cwd=self.working_dir
             )
             # Wait for initial prompt
             self.process.expect(CLINE_PROMPT_PATTERN, timeout=30)
@@ -158,13 +165,39 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     await update.message.reply_text(
-        "Welcome to Cline Bridge!\n\n"
+        "🤖 *Welcome to Cline Bridge!*\n\n"
         "Send any message to interact with Cline.\n\n"
-        "Commands:\n"
+        "*Commands:*\n"
+        "/info - Show Cline context (dir, model)\n"
+        "/status - Check if Cline is running\n"
         "/reset - Restart Cline session\n"
-        "/status - Check Cline status\n"
-        "/kill - Kill and restart session"
+        "/cd <path> - Change working directory\n"
+        "/model <name> - Change AI model\n"
+        "/kill - Kill and restart session",
+        parse_mode="Markdown"
     )
+
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /info command - show current Cline context."""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("Unauthorized access.")
+        return
+    
+    cline = bridge.cline
+    status = "🟢 Running" if cline.is_alive() else "🔴 Stopped"
+    
+    info = (
+        f"📊 *Cline Context*\n\n"
+        f"*Status:* {status}\n"
+        f"*Working Directory:*\n`{cline.working_dir}`\n"
+        f"*Model:* `{cline.model}`\n"
+        f"*Timeout:* {CLINE_TIMEOUT}s\n"
+    )
+    
+    await update.message.reply_text(info, parse_mode="Markdown")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -201,6 +234,73 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     result = bridge.cline.restart()
     await update.message.reply_text(f"Session killed and restarted.\n{result}")
+
+
+async def cd_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cd command - change working directory."""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("Unauthorized access.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            f"Current directory: `{bridge.cline.working_dir}`\n"
+            f"Usage: /cd <path>",
+            parse_mode="Markdown"
+        )
+        return
+    
+    new_dir = " ".join(context.args)
+    
+    # Handle relative paths
+    if not os.path.isabs(new_dir):
+        new_dir = os.path.abspath(os.path.join(bridge.cline.working_dir, new_dir))
+    
+    # Validate directory
+    if not os.path.isdir(new_dir):
+        await update.message.reply_text(f"❌ Directory not found: `{new_dir}`", parse_mode="Markdown")
+        return
+    
+    # Update working directory and restart
+    bridge.cline.working_dir = new_dir
+    result = bridge.cline.restart()
+    
+    await update.message.reply_text(
+        f"📁 Changed to: `{new_dir}`\n{result}",
+        parse_mode="Markdown"
+    )
+
+
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /model command - change or show model."""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("Unauthorized access.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            f"Current model: `{bridge.cline.model}`\n"
+            f"Usage: /model <model_name>\n\n"
+            f"Common models:\n"
+            f"• `claude-3-5-sonnet-20241022`\n"
+            f"• `claude-3-opus-20240229`\n"
+            f"• `claude-3-haiku-20240307`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    new_model = " ".join(context.args)
+    bridge.cline.model = new_model
+    
+    await update.message.reply_text(
+        f"🧠 Model set to: `{new_model}`\n"
+        f"Note: Restart Cline for this to take effect with /reset",
+        parse_mode="Markdown"
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -242,9 +342,12 @@ def main() -> None:
     
     # Register handlers
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CommandHandler("info", info_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("kill", kill_command))
+    application.add_handler(CommandHandler("cd", cd_command))
+    application.add_handler(CommandHandler("model", model_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Start bot

@@ -59,8 +59,11 @@ A Telegram bot that connects to a locally running Cline CLI instance in interact
 | Command | Description |
 |---------|-------------|
 | `/start` | Start the bot and see available commands |
-| `/reset` | Restart the Cline session |
+| `/info` | Show Cline context (working directory, model, status) |
 | `/status` | Check if Cline is running |
+| `/reset` | Restart the Cline session |
+| `/cd <path>` | Change working directory and restart Cline |
+| `/model <name>` | Set AI model (requires /reset to apply) |
 | `/kill` | Kill and restart the session |
 
 ## Configuration
@@ -71,8 +74,23 @@ Environment variables can be customized:
 |----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Required | Your Telegram bot token |
 | `AUTHORIZED_USER_ID` | Required | Your Telegram user ID |
+| `CLINE_WORKING_DIR` | Current directory | Working directory for Cline |
+| `CLINE_MODEL` | `claude-3-5-sonnet-20241022` | AI model for Cline |
 | `CLINE_PROMPT_PATTERN` | `\n>` | Regex pattern to detect Cline prompt |
 | `CLINE_TIMEOUT` | `120` | Timeout in seconds for Cline responses |
+
+## Viewing Cline Context
+
+Use `/info` from Telegram to see:
+- 🟢/🔴 Status (running/stopped)
+- 📁 Working directory
+- 🧠 AI model
+- ⏱️ Timeout setting
+
+This helps you understand:
+- **Which folder** Cline is working in
+- **Which model** is being used
+- **If Cline is alive** and ready
 
 ## Architecture
 
