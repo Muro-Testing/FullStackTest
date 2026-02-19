@@ -26,8 +26,9 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 # Cline configuration
 CLINE_TIMEOUT = int(os.getenv("CLINE_TIMEOUT", "120"))
 CLINE_WORKING_DIR = os.getenv("CLINE_WORKING_DIR", os.getcwd())
-CLINE_MODEL = os.getenv("CLINE_MODEL", "claude-3-5-sonnet-20241022")
+CLINE_MODEL = os.getenv("CLINE_MODEL", "z-ai/glm-5")
 CLINE_YOLO = os.getenv("CLINE_YOLO", "true").lower() == "true"
+CLINE_PATH = os.getenv("CLINE_PATH", "cline")  # Full path to cline executable if not in PATH
 
 # Logging setup
 logging.basicConfig(
@@ -113,7 +114,7 @@ class TelegramClineBridge:
                 import json
                 
                 # Build Cline command
-                cmd = ["cline"]
+                cmd = [CLINE_PATH]  # Use configured path to cline
                 
                 if CLINE_YOLO:
                     cmd.append("--yolo")
