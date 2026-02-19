@@ -43,12 +43,18 @@ CLINE_MODEL = os.getenv("CLINE_MODEL", "z-ai/glm-5")
 CLINE_YOLO = os.getenv("CLINE_YOLO", "true").lower() == "true"
 CLINE_PATH = os.getenv("CLINE_PATH", "cline")  # Full path to cline executable if not in PATH
 
-# Logging setup
+# Logging setup - reduce noise from httpx
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Silence httpx INFO logs (they're very verbose)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Application").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
 
 
 class ClineSession:
@@ -801,21 +807,111 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(f"❌ Failed to send: `{os.path.basename(file_path)}` - {str(e)}", parse_mode="Markdown")
 
 
+def handle_terminal_command(message: str) -> bool:
+    """Handle terminal commands locally. Returns True if command was handled."""
+    global bridge
+    
+    msg = message.strip().lower()
+    args = message.strip().split(maxsplit=1)
+    arg = args[1] if len(args) > 1 else None
+    
+    # /status or /info
+    if msg in ['/status', '/info']:
+        stats = bridge.cline.get_stats()
+        print(f"\n📊 Session Status:")
+        print(f"   Task ID: {stats['task_id'] or 'None'}")
+        print(f"   Model: {stats['model']}")
+        print(f"   Directory: {stats['working_dir']}")
+        print(f"   Messages: {stats['messages']}\n")
+        return True
+    
+    # /reset
+    if msg == '/reset':
+        bridge.cline.restart()
+        print("\n✅ Session reset. Next message starts fresh.\n")
+        return True
+    
+    # /tasks
+    if msg == '/tasks':
+        print("\n📋 Run 'cline history' in a separate terminal to see tasks.")
+        print("   Then use /resume <taskId> to continue.\n")
+        return True
+    
+    # /resume <id>
+    if msg.startswith('/resume '):
+        task_id = arg
+        if task_id:
+            bridge.cline.task_id = task_id
+            print(f"\n✅ Task set to: {task_id}")
+            print("   Next message will continue this task.\n")
+        else:
+            print("\nUsage: /resume <taskId>\n")
+        return True
+    
+    # /model
+    if msg == '/model':
+        print(f"\n🧠 Current model: {bridge.cline.model}")
+        print("   Usage: /model <model_name>\n")
+        return True
+    
+    if msg.startswith('/model '):
+        if arg:
+            bridge.cline.model = arg
+            print(f"\n✅ Model set to: {arg}")
+            print("   Use /reset to apply.\n")
+        return True
+    
+    # /files
+    if msg == '/files':
+        files = bridge.scan_files()
+        if files:
+            print(f"\n📂 Files ({len(files)}):")
+            for f in files[:20]:
+                print(f"   • {os.path.basename(f)}")
+            if len(files) > 20:
+                print(f"   ... and {len(files) - 20} more\n")
+        else:
+            print("\n📂 No files found.\n")
+        return True
+    
+    # /help
+    if msg in ['/help', '/start']:
+        print("""
+🖥️  TERMINAL COMMANDS:
+   /status, /info  - Show session status
+   /reset          - Start new session
+   /tasks          - Show task info
+   /resume <id>    - Resume a task
+   /model [name]   - Show/set model
+   /files          - List files
+   /help           - Show this help
+   
+💬 Any other message goes to Cline!
+""")
+        return True
+    
+    return False
+
+
 def terminal_input_thread():
     """Thread to read terminal input and queue it for Cline."""
     print("\n" + "="*60)
     print("🖥️  TERMINAL INPUT MODE")
     print("="*60)
-    print("Type your message and press Enter to send to Cline.")
-    print("Messages will be sent from both Terminal AND Telegram.")
+    print("Commands: /status /reset /tasks /resume /model /files /help")
+    print("Any other message goes to Cline.")
     print("="*60 + "\n")
     
     while True:
         try:
             user_input = input("💬 You: ")
             if user_input.strip():
-                terminal_input_queue.put(user_input)
-                print("✅ Message queued for Cline...\n")
+                # Check if it's a local command
+                if user_input.strip().startswith('/'):
+                    handle_terminal_command(user_input)
+                else:
+                    terminal_input_queue.put(user_input)
+                    print("🔄 Sending to Cline...\n")
         except EOFError:
             break
         except KeyboardInterrupt:
