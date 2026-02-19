@@ -437,6 +437,68 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(info, parse_mode="Markdown")
 
 
+async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /tasks command - list recent tasks."""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("Unauthorized access.")
+        return
+    
+    # Run cline history to get task list
+    try:
+        process = await asyncio.create_subprocess_exec(
+            CLINE_PATH, "history",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=bridge.cline.working_dir
+        )
+        stdout, stderr = await process.communicate()
+        output = stdout.decode('utf-8', errors='replace')
+        
+        if not output.strip():
+            await update.message.reply_text("📋 No tasks found.")
+            return
+        
+        # Parse and format tasks
+        lines = output.strip().split('\n')[:20]  # Last 20 tasks
+        msg = "📋 *Recent Tasks:*\n\n"
+        
+        for line in lines:
+            if line.strip():
+                # Clean up the line
+                clean = line.strip()[:100]
+                msg += f"`{clean}`\n"
+        
+        msg += "\n_Use /resume <taskId> to continue a task_"
+        
+        await update.message.reply_text(msg[:4000], parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error listing tasks: {str(e)}")
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /resume command - resume a specific task."""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("Unauthorized access.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /resume <taskId>\nUse /tasks to list available tasks.", parse_mode="Markdown")
+        return
+    
+    task_id = context.args[0]
+    bridge.cline.task_id = task_id
+    
+    await update.message.reply_text(
+        f"✅ Task set to: `{task_id}`\n"
+        f"Next message will continue this task.",
+        parse_mode="Markdown"
+    )
+
+
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /reset command."""
     user_id = update.effective_user.id
@@ -829,6 +891,8 @@ def main() -> None:
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("files", files_command))
     application.add_handler(CommandHandler("get", get_command))
+    application.add_handler(CommandHandler("tasks", tasks_command))
+    application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Start bot with terminal input processing
